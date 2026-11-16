@@ -337,7 +337,7 @@ async fn handle_poll(
     let rx = registry.register(&group, &id).await;
 
     match rx {
-        Some((conn, mut rx)) => {
+        Some((conn, mut rx, mut close_rx)) => {
             tracing::info!(
                 group = %group,
                 id = %id,
@@ -358,6 +358,7 @@ async fn handle_poll(
                     }
                     tokio::select! {
                         biased;
+                        _ = &mut close_rx => break,
                         result = sse_shutdown.changed() => {
                             // Sender dropped or value changed; check if shutdown fired.
                             if result.is_err() || *sse_shutdown.borrow() {

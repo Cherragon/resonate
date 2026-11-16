@@ -7,7 +7,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use std::sync::Mutex as StdMutex;
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 use super::{PollAddress, PollCast};
 
@@ -17,6 +18,18 @@ pub struct PollConnection {
     pub conn_id: u64,
     pub id: String,
     pub tx: mpsc::Sender<String>,
+    /// Fires when a newer connection claims this same group and id.
+    close_tx: StdMutex<Option<oneshot::Sender<()>>>,
+}
+
+impl PollConnection {
+    fn request_close(&self) {
+        if let Ok(mut slot) = self.close_tx.lock() {
+            if let Some(tx) = slot.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
 }
 
 /// Manages all active poll connections, grouped by group name.
@@ -39,16 +52,39 @@ impl PollRegistry {
         }
     }
 
-    /// Register a new connection. Returns the receiver end of the message channel.
-    /// Returns None if max connections exceeded.
+    /// Register a connection. A newer connection with the same group and id
+    /// replaces the older one and closes it. Returns None if max connections
+    /// would be exceeded by a connection that is not a replacement.
     pub async fn register(
         &self,
         group: &str,
         id: &str,
-    ) -> Option<(Arc<PollConnection>, mpsc::Receiver<String>)> {
+    ) -> Option<(
+        Arc<PollConnection>,
+        mpsc::Receiver<String>,
+        oneshot::Receiver<()>,
+    )> {
         let mut conns = self.connections.lock().await;
 
-        // Check total connection count
+        // The worker is the source of truth for its identity. A reconnect
+        // presents the same group and id while the old TCP connection can
+        // still be registered. Delivering to the first match would starve
+        // the live connection, so the stale record is closed and removed
+        // before the capacity check.
+        let mut replaced_group_is_empty = false;
+        if let Some(group_conns) = conns.get_mut(group) {
+            let (stale, live): (Vec<_>, Vec<_>) =
+                group_conns.drain(..).partition(|conn| conn.id == id);
+            *group_conns = live;
+            for old in stale {
+                old.request_close();
+            }
+            replaced_group_is_empty = group_conns.is_empty();
+        }
+        if replaced_group_is_empty {
+            conns.remove(group);
+        }
+
         let total: usize = conns.values().map(|v| v.len()).sum();
         if total >= self.max_connections {
             return None;
@@ -56,10 +92,12 @@ impl PollRegistry {
 
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(self.buffer_size);
+        let (close_tx, close_rx) = oneshot::channel();
         let conn = Arc::new(PollConnection {
             conn_id,
             id: id.to_string(),
             tx,
+            close_tx: StdMutex::new(Some(close_tx)),
         });
 
         conns
@@ -75,7 +113,7 @@ impl PollRegistry {
             "Poll connection registered"
         );
 
-        Some((conn, rx))
+        Some((conn, rx, close_rx))
     }
 
     /// Deregister a specific connection by its unique connection ID.
@@ -159,5 +197,55 @@ impl PollRegistry {
             );
         }
         delivered
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{PollAddress, PollCast};
+    use super::PollRegistry;
+
+    fn uni(group: &str, id: &str) -> PollAddress {
+        PollAddress {
+            cast: PollCast::Uni,
+            group: group.to_string(),
+            id: Some(id.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_identity_delivers_to_the_newest_connection() {
+        let registry = PollRegistry::new(8, 8);
+        let (other, mut other_rx, _other_close) = registry.register("g", "other").await.unwrap();
+        let (old, mut old_rx, mut old_close) = registry.register("g", "pid").await.unwrap();
+        let (new, mut new_rx, _new_close) = registry.register("g", "pid").await.unwrap();
+
+        assert_ne!(old.conn_id, new.conn_id);
+        old_close
+            .try_recv()
+            .expect("the stale connection should be closed");
+        assert!(registry.send_poll(&uni("g", "pid"), "hello").await);
+        assert!(registry.send_poll(&uni("g", "other"), "peer").await);
+        assert_eq!(other_rx.try_recv().unwrap(), "peer");
+        let _ = other;
+        assert_eq!(new_rx.try_recv().unwrap(), "hello");
+        assert!(old_rx.try_recv().is_err());
+
+        registry.deregister("g", old.conn_id).await;
+        assert!(registry.send_poll(&uni("g", "pid"), "kept").await);
+        assert_eq!(new_rx.try_recv().unwrap(), "kept");
+
+        registry.deregister("g", new.conn_id).await;
+        assert!(!registry.send_poll(&uni("g", "pid"), "gone").await);
+    }
+
+    #[tokio::test]
+    async fn replacement_does_not_consume_a_second_connection_slot() {
+        let registry = PollRegistry::new(1, 8);
+        let _old = registry.register("g", "pid").await.unwrap();
+        assert!(
+            registry.register("g", "pid").await.is_some(),
+            "replacing the only connection must not be rejected as over capacity"
+        );
     }
 }
